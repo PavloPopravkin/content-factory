@@ -1,0 +1,40 @@
+schema_version: 1
+slug: demo
+name: Demo Foundation
+timezone: Europe/Kyiv
+languages:
+  content: [uk]
+  ops: en
+  contributors: [uk, en]
+brand:
+  logo: logo.svg
+  font: Inter
+  subtitle_style: white text, dark background
+policy_file: policy.md
+schedule:
+  daily_caps:
+    post: 10
+    reel: 3
+    story: 10
+  min_gap_minutes: 30
+  hours: ["00:00", "24:00"]
+  blackout:
+    - type: weekly
+      from: "fri 15:00"
+      to: "sat 21:00"
+    - type: sunset_shabbat
+      lat: 50.4501
+      lon: 30.5234
+      margin_before_min: 30
+      margin_after_min: 70
+approval:
+  mode: manual
+  require_for_kinds: [reel, story]
+channels:
+  - id: demo-feed
+    type: tg_channel
+    publisher: dry
+    external_id: demo-channel
+    secret_ref: DEMO_TELEGRAM_TOKEN
+    voice: Friendly and concrete; use only supplied facts.
+    capabilities: [post, carousel, reel, story]
