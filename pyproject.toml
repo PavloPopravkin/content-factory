@@ -7,7 +7,7 @@ name = "content-factory"
 version = "0.1.0"
 description = "Tenant-isolated deterministic content planning and publishing core"
 requires-python = ">=3.12"
-dependencies = ["pydantic>=2", "httpx", "pyyaml", "typer"]
+dependencies = ["pydantic>=2", "httpx", "pyyaml", "typer", "tzdata"]
 
 [project.optional-dependencies]
 dev = ["pytest", "respx"]

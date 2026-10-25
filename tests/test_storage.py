@@ -11,7 +11,7 @@ def test_migrations_wal_idempotence_and_tenant_columns(store):
     store.migrate()
     assert store.db.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     assert store.db.execute("PRAGMA foreign_keys").fetchone()[0] == 1
-    assert store.db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 1
+    assert store.db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 2
     tables = [r[0] for r in store.db.execute("SELECT name FROM sqlite_master WHERE type='table'")]
     for table in tables:
         columns = {r[1]: r for r in store.db.execute(f"PRAGMA table_info({table})")}

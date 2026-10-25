@@ -1,6 +1,6 @@
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import os
 
 import httpx
@@ -9,7 +9,7 @@ from .config import Channel, Tenant
 from .models import Delivery, Result, Slot, State
 from .planner import admit, blackout_violations
 from .publishers import DryPublisher, MetaPublisher, PostizPublisher, TelegramPublisher
-from .publishers.base import PolicyBlocked, Publisher, PublisherError
+from .publishers.base import PolicyBlocked, PublishDeferred, Publisher, PublisherError
 from .storage import Store
 
 
@@ -22,6 +22,8 @@ class TickReport:
     blocked: int = 0
     skipped: int = 0
     reconciled: int = 0
+    deferred: int = 0
+    missed: int = 0
 
     def __str__(self) -> str:
         return " ".join(f"{key}={value}" for key, value in vars(self).items())
@@ -87,36 +89,39 @@ def _tick(store: Store, tenant: Tenant, clock: Callable[[], datetime], factory: 
             continue
         except (PublisherError, ValueError) as exc:
             # Failure of a read cannot prove that an accepted write failed.
-            store.checkpoint(delivery, Result(state=State.UNKNOWN, error=str(exc)))
+            store.event(tenant.slug, "reconcile_error", slot_id=delivery.slot_id, delivery_id=delivery.id,
+                        details={"error": str(exc)})
 
     for slot in store.slots(tenant.slug):
-        if slot.cancelled or slot.at > clock():
+        if slot.cancelled or slot.missed or slot.at > clock():
             continue
-        done_channels = {d.channel_id for d in store.deliveries(tenant.slug, slot.id)}
+        deliveries = {d.channel_id: d for d in store.deliveries(tenant.slug, slot.id)}
+        pending = [c for c in slot.channel_ids if c not in deliveries or deliveries[c].state == State.DEFERRED]
+        if pending and clock() - slot.at > timedelta(minutes=tenant.schedule.max_lateness_minutes):
+            store.miss(slot)
+            report.missed += 1
+            emit(f"missed {slot.id}: maximum lateness exceeded")
+            continue
         for channel_id in slot.channel_ids:
-            if channel_id in done_channels:
+            previous = deliveries.get(channel_id)
+            if previous and (previous.state != State.DEFERRED or previous.next_attempt_at > clock()):
                 report.skipped += 1
                 continue
-            channel = tenant.channel(channel_id)
+            delivery: Delivery | None = None
+            fingerprint: str | None = None
 
             def send_gate() -> None:
-                fresh = store.get_slot(tenant.slug, slot.id)
-                if fresh.version != slot.version:
-                    raise PolicyBlocked("slot version changed during submission")
+                fresh = store.check_approval(store.get_slot(tenant.slug, slot.id))
+                if (fresh.version != slot.version or fresh.caption != slot.caption
+                        or fresh.media_ids != slot.media_ids or set(fresh.channel_ids) != set(slot.channel_ids)
+                        or (fingerprint is not None and store.content_hash(fresh) != fingerprint)):
+                    raise PolicyBlocked("slot content changed during submission")
+                if clock() - fresh.at > timedelta(minutes=tenant.schedule.max_lateness_minutes):
+                    raise PolicyBlocked("maximum lateness exceeded")
                 candidate = fresh.model_copy(update={"at": clock(), "channel_ids": [channel_id]})
                 violations = admit(candidate, tenant, store.history(tenant.slug))
                 if violations:
                     raise PolicyBlocked(", ".join(violations))
-
-            try:
-                send_gate()
-            except PolicyBlocked as exc:
-                report.blocked += 1
-                emit(f"blocked {slot.id}/{channel_id}: {exc}")
-                continue
-            # Preflight media and credentials before writing the attempt fence.
-            media = store.media(slot)
-            delivery: Delivery | None = None
 
             def checkpoint(result: Result) -> None:
                 if delivery is None:
@@ -124,16 +129,46 @@ def _tick(store: Store, tenant: Tenant, clock: Callable[[], datetime], factory: 
                 store.checkpoint(delivery, result)
 
             try:
+                channel = tenant.channel(channel_id)
+                media = store.media(slot)
+                send_gate()
+                fingerprint = store.content_hash(slot)
                 adapter = factory(channel, client, send_gate, checkpoint)
-                delivery = store.begin_delivery(slot, channel_id, at=clock())
+                if isinstance(adapter, PostizPublisher):
+                    def reserve_post() -> None:
+                        send_gate()
+                        wait = store.consume_postiz_token(tenant.slug, adapter.rate_scope, adapter.api_limit, clock())
+                        if wait:
+                            raise PublishDeferred("Postiz org API_LIMIT budget exhausted", wait)
+                    adapter.reserve_post = reserve_post
+                delivery = (store.retry_delivery(previous, at=clock()) if previous
+                            else store.begin_delivery(slot, channel_id, at=clock()))
                 result = adapter.publish(delivery, slot, channel, media)
                 if result.state == State.SUBMITTING:
                     raise ValueError("publisher returned nonterminal submitting result")
                 store.checkpoint(delivery, result)
+            except PublishDeferred as exc:
+                if delivery is None:
+                    raise
+                if isinstance(adapter, PostizPublisher):
+                    store.postpone_postiz(tenant.slug, adapter.rate_scope, adapter.api_limit, clock(), exc.retry_after)
+                if store.parts(tenant.slug, delivery.id):
+                    # Earlier public effects cannot be replayed with a fresh publish call.
+                    result = Result(state=State.UNKNOWN, error=str(exc))
+                    store.checkpoint(delivery, result)
+                else:
+                    store.defer(delivery, at=clock() + timedelta(seconds=exc.retry_after), error=str(exc))
+                    result = Result(state=State.DEFERRED, error=str(exc))
             except (PublisherError, ValueError, OSError) as exc:
                 if delivery is None:
-                    report.failed += 1
-                    emit(f"preflight failed {slot.id}/{channel_id}: {exc}")
+                    if isinstance(exc, PolicyBlocked):
+                        report.blocked += 1
+                        emit(f"blocked {slot.id}/{channel_id}: {exc}")
+                    else:
+                        report.failed += 1
+                        store.event(tenant.slug, "preflight_failed", slot_id=slot.id,
+                                    details={"channel_id": channel_id, "error": str(exc)})
+                        emit(f"preflight failed {slot.id}/{channel_id}: {exc}")
                     continue
                 uncertain = (getattr(exc, "uncertain", False) or bool(delivery.external_ids)
                              or bool(store.parts(tenant.slug, delivery.id)))
@@ -141,7 +176,6 @@ def _tick(store: Store, tenant: Tenant, clock: Callable[[], datetime], factory: 
                 store.checkpoint(delivery, Result(state=state, error=str(exc)))
                 result = Result(state=state, error=str(exc))
             except Exception:
-                # Keep the committed fence even for unexpected implementation failures.
                 if delivery is not None:
                     store.checkpoint(delivery, Result(state=State.UNKNOWN, error="unexpected publisher failure"))
                 raise

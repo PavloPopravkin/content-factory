@@ -21,6 +21,7 @@ class State(StrEnum):
     PUBLISHED = "published"
     FAILED = "failed"
     UNKNOWN = "unknown"
+    DEFERRED = "deferred"
 
 
 def new_id() -> str:
@@ -32,6 +33,8 @@ class Asset(Model):
     tenant_slug: str
     source: str
     kind: str = Field(pattern=r"^(photo|video)$")
+    sha256: str | None = None
+    size: int | None = Field(default=None, ge=0)
     width: int | None = Field(default=None, gt=0)
     height: int | None = Field(default=None, gt=0)
     duration: float | None = Field(default=None, gt=0)
@@ -48,6 +51,8 @@ class Slot(Model):
     version: int = Field(default=1, ge=1)
     approved_version: int | None = Field(default=None, ge=1)
     cancelled: bool = False
+    approved_hash: str | None = None
+    missed: bool = False
 
     @model_validator(mode="after")
     def unique_references(self) -> "Slot":
@@ -71,6 +76,7 @@ class Delivery(Model):
     external_ids: dict[str, Any] = Field(default_factory=dict)
     error: str | None = None
     created_at: AwareDatetime | None = None
+    next_attempt_at: AwareDatetime | None = None
 
 
 class Part(Model):

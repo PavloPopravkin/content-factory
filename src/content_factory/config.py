@@ -54,6 +54,7 @@ Blackout = Annotated[WeeklyBlackout | SunsetShabbat, Field(discriminator="type")
 class Schedule(Model):
     daily_caps: dict[Kind, int]
     min_gap_minutes: int = Field(ge=0)
+    max_lateness_minutes: int = Field(default=180, ge=0)
     hours: tuple[str, str]
     blackout: list[Blackout] = Field(default_factory=list)
 

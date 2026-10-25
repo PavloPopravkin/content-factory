@@ -83,6 +83,9 @@ class TelegramPublisher(HttpPublisher):
                 source = item.pop("media")
                 method = "sendVideo" if kind == "video" else "sendPhoto"
                 payload = {"chat_id": self.chat_id, kind: source, **item}
+                if attachments:
+                    attachments = {kind: attachments["media0"]}
+                    del payload[kind]
             if attachments:
                 data = {k: json.dumps(v) if isinstance(v, (dict, list, bool)) else str(v) for k, v in payload.items()}
                 result = self._call(method, data=data, files=attachments)

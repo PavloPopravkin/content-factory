@@ -46,6 +46,8 @@ def admit(slot: Slot, tenant: Tenant, existing: list[Slot]) -> list[str]:
     if slot.tenant_slug != tenant.slug:
         return ["tenant mismatch"]
     violations = []
+    if slot.missed:
+        violations.append("slot missed")
     if slot.cancelled:
         violations.append("slot cancelled")
     local = slot.at.astimezone(ZoneInfo(tenant.timezone))

@@ -1,5 +1,8 @@
 from collections.abc import Callable
 from contextlib import ExitStack
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+import hashlib
 import json
 import math
 import mimetypes
@@ -19,6 +22,12 @@ class PublisherError(RuntimeError):
 
 class PublishRejected(PublisherError):
     pass
+
+
+class PublishDeferred(PublisherError):
+    def __init__(self, message: str, retry_after: float = 60):
+        super().__init__(message)
+        self.retry_after = max(1, retry_after) if math.isfinite(retry_after) else 60
 
 
 class UnknownResult(PublisherError):
@@ -53,6 +62,33 @@ class HttpPublisher:
         except httpx.RequestError as exc:
             # Deliberately omit request URLs and bodies: Telegram URLs contain the bot token.
             raise UnknownResult(f"transport {type(exc).__name__}; verify externally before retry") from None
+        try:
+            body = response.json()
+        except (ValueError, UnicodeError):
+            body = None
+        error = body.get("error", {}) if isinstance(body, dict) else {}
+        graph_throttle = (isinstance(error, dict) and error.get("code") in (4, 17, 32, 613)
+                          and httpx.URL(url).host == "graph.facebook.com")
+        telegram_throttle = (isinstance(body, dict) and body.get("ok") is False and body.get("error_code") == 429
+                             and httpx.URL(url).host == "api.telegram.org")
+        if (response.status_code == 429 or graph_throttle or telegram_throttle
+                or (400 <= response.status_code < 500 and response.status_code != 408
+                    and "Retry-After" in response.headers)):
+            delays = [60.0]
+            parameters = body.get("parameters", {}) if isinstance(body, dict) else {}
+            if isinstance(parameters, dict) and isinstance(parameters.get("retry_after"), (int, float)):
+                delays = [float(parameters["retry_after"])]
+            header = response.headers.get("Retry-After")
+            if header:
+                try:
+                    delay = float(header)
+                except ValueError:
+                    try:
+                        delay = (parsedate_to_datetime(header) - datetime.now(timezone.utc)).total_seconds()
+                    except (ValueError, TypeError, OverflowError):
+                        delay = 60.0
+                delays = [max(delay, delays[0])] if parameters else [delay]
+            raise PublishDeferred("provider rate limit; request rejected before acceptance", max(delays))
         if response.status_code >= 500 or response.status_code in (408,):
             raise UnknownResult(f"provider HTTP {response.status_code}; acceptance uncertain")
         if response.is_error:
@@ -96,6 +132,11 @@ def remote_url(asset: Asset) -> str:
 def media_file(stack: ExitStack, asset: Asset) -> tuple:
     path = Path(asset.source)
     file = stack.enter_context(path.open("rb"))
+    if asset.sha256 is not None:
+        actual = hashlib.file_digest(file, "sha256").hexdigest()
+        if actual != asset.sha256 or (asset.size is not None and path.stat().st_size != asset.size):
+            raise PublishRejected("media changed since approval/ingest")
+        file.seek(0)
     return (path.name, file, mimetypes.guess_type(path.name)[0] or "application/octet-stream")
 
 

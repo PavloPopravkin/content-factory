@@ -99,11 +99,10 @@ def slot_add(ctx: typer.Context, tenant: Annotated[str, typer.Option()],
                 caption=caption, media_ids=[a.id for a in assets])
     with Store(ctx.obj.db) as store:
         store.migrate()
-        with store.lock():
-            store.register(config)
-            for asset in assets:
-                store.add_asset(asset)
-            store.add_slot(slot)
+        store.register(config)
+        for asset in assets:
+            store.add_asset(asset)
+        store.add_slot(slot)
     typer.echo(slot.id)
 
 
@@ -123,8 +122,7 @@ def slot_tenant(store: Store, slot_id: str, tenant: str | None) -> str:
 def slot_approve(ctx: typer.Context, slot_id: str, tenant: Annotated[str | None, typer.Option()] = None) -> None:
     with Store(ctx.obj.db) as store:
         store.migrate()
-        with store.lock():
-            store.approve(slot_tenant(store, slot_id, tenant), slot_id)
+        store.approve(slot_tenant(store, slot_id, tenant), slot_id)
     typer.echo(f"approved {slot_id}")
 
 
@@ -133,8 +131,7 @@ def slot_approve(ctx: typer.Context, slot_id: str, tenant: Annotated[str | None,
 def slot_cancel(ctx: typer.Context, slot_id: str, tenant: Annotated[str | None, typer.Option()] = None) -> None:
     with Store(ctx.obj.db) as store:
         store.migrate()
-        with store.lock():
-            store.cancel(slot_tenant(store, slot_id, tenant), slot_id)
+        store.cancel(slot_tenant(store, slot_id, tenant), slot_id)
     typer.echo(f"cancelled {slot_id}; existing publications are retained")
 
 
@@ -158,7 +155,9 @@ def status(ctx: typer.Context, tenant: Annotated[str, typer.Option()]) -> None:
             deliveries = store.deliveries(tenant, slot.id)
             states = ",".join(f"{d.channel_id}={d.state}" for d in deliveries) or "pending"
             typer.echo(f"{slot.id} {slot.at.isoformat()} {slot.kind} v{slot.version} "
-                       f"approved={slot.approved_version} cancelled={slot.cancelled} {states}")
+                       f"approved={slot.approved_version} cancelled={slot.cancelled} missed={slot.missed} {states}")
             for delivery in deliveries:
                 if delivery.error:
                     typer.echo(f"  {delivery.channel_id}: {delivery.error}")
+                if delivery.next_attempt_at:
+                    typer.echo(f"  next_attempt_at={delivery.next_attempt_at.isoformat()}")

@@ -80,6 +80,13 @@ Minimum gaps apply between all publication kinds and use elapsed UTC time across
 Multiple images/videos in a `post` require the channel's `carousel` capability.
 Manual approval, or a kind-specific approval requirement, binds to the exact slot version.
 `Store.revise()` increments the version and clears approval; slots with an existing delivery cannot be revised.
+Approval also stores a SHA-256 of the caption, kind, ordered media and channel configuration. Local files store
+their SHA-256 and size at ingest/approval and are checked again before upload. Before each request, content or
+target changes reset approval. URL media pins the URL and metadata, **not the bytes behind the URL**; use immutable
+URLs for approved derivatives. Remote media is not downloaded for integrity checks.
+`schedule.max_lateness_minutes` defaults to 180. Older slots with unsent channels become `missed`, appear in
+`cf status`, and require a new slot; existing accepted/published objects remain in the delivery journal.
+Python's `tzdata` dependency supplies IANA timezones even when the host has no timezone database.
 
 Sunset blackout uses the offline [NOAA solar equations](https://gml.noaa.gov/grad/solcalc/solareqns.PDF),
 from Friday sunset minus `margin_before_min` to Saturday sunset plus `margin_after_min`.
@@ -93,9 +100,12 @@ executable rules or check consent/content facts; deterministic rules come from t
 ## Storage and delivery semantics
 
 Plain SQL in `migrations/NNN_*.sql` is applied in order with checksums and a transaction per migration.
-Migrations ship inside the wheel. SQLite uses WAL, foreign keys and a database-wide POSIX file lock for ticks,
-migrations and CLI mutations. Every table has `tenant_slug NOT NULL`; all domain links use composite tenant FKs.
+Migrations ship inside the wheel. SQLite uses WAL, foreign keys and a database-wide POSIX file lock for ticks
+and pending migrations. An already migrated database needs no file lock for CLI reads or mutations, so cancel
+works while a tick is in an HTTP call. CLI writes use short SQLite transactions. Every table has
+`tenant_slug NOT NULL`; all domain links use composite tenant FKs.
 `schema_migrations` is global metadata with reserved scope `__schema__`.
+Migration 002 retains the delivery/part/event ledger and clears legacy approvals that had no content hash.
 
 A committed `submitting` delivery with a unique key is written **before** the adapter's first HTTP request.
 The `(tenant, slot, channel)` fence also prevents a later version from silently republishing the same slot.
@@ -106,9 +116,13 @@ an incomplete multi-request publication. Event records and checkpoints commit at
 - `published` is terminal and is never resent.
 - A timeout, connection loss, malformed response or ambiguous server error becomes `unknown`.
 - An interrupted `submitting` fence becomes `unknown` on the next tick.
-- Existing deliveries, including `failed` and `unknown`, are never automatically submitted again.
+- `failed`, `unknown`, `accepted` and `published` deliveries are never automatically submitted again.
+- An explicit rate-limit rejection without public parts becomes `deferred` with a persisted `next_attempt_at`.
+  A due retry retains the unique fence, increments attempts, rechecks all policy and restages private uploads.
+  If earlier steps already produced public parts, the delivery stays `unknown` and is never replayed.
 - Tick reconciles `accepted`/`unknown` through read-only adapter hooks when it can identify the external job.
   Telegram lost responses and Meta responses without final IDs need manual verification. No ID is invented.
+  A failed reconciliation read records an event and preserves the delivery state and original error.
 
 Admission runs at actual send time, against attempted publication history, before **each HTTP request**.
 Attempted/uncertain/failed slots conservatively consume caps and gaps; queued slots do not deadlock one another.
@@ -145,6 +159,10 @@ need externally accessible publishing derivatives. This package does not expose 
 Postiz uses `/api/public/v1` and `Authorization: <key>` without `Bearer`, as in the
 [Public API contract](https://docs.postiz.com/public-api/posts/create). `PUBLISHED` requires a `releaseId`;
 `ERROR` maps to failed; unrecognized states remain unknown. FB Reels require the direct Meta adapter.
+The scheduler persists a token bucket shared by Postiz URL and org key, including key aliases. Set
+`CF_POSTIZ_API_LIMIT` to the server's `API_LIMIT` (fallback `API_LIMIT`, default 30 requests/hour).
+The bucket permits one initial request, then refills at that hourly rate; it defers rather than sleeping.
+Only `POST /posts` consumes this budget. Provider `Retry-After` also postpones the whole org bucket.
 Optional non-secret `channel.settings` passes provider DTO fields through to Postiz. For example, YouTube needs
 `title` and `type`; TikTok needs its provider settings including `content_posting_method: DIRECT_POST`.
 Postiz's DELETE API removes the internal schedule, not a published social object, so `delete(part)` explicitly

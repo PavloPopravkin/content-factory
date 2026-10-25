@@ -66,7 +66,7 @@ def test_cap_does_not_block_same_slot_second_channel(store, tenant, slot, now, c
 
 def test_backlog_respects_real_time_gap(store, tenant, slot, now, client):
     tenant.schedule.min_gap_minutes = 30
-    slot.at = now - timedelta(days=1)
+    slot.at = now - timedelta(hours=2)
     later = slot.model_copy(update={"id": "later", "at": slot.at + timedelta(hours=1)})
     store.add_slot(slot)
     store.add_slot(later)
@@ -77,7 +77,7 @@ def test_backlog_respects_real_time_gap(store, tenant, slot, now, client):
 
 def test_blackout_at_actual_time_not_old_schedule(store, tenant, slot, client):
     tenant.schedule.blackout = [WeeklyBlackout.model_validate({"type": "weekly", "from": "fri 15:00", "to": "sat 21:00"})]
-    slot.at = datetime.fromisoformat("2026-10-22T10:00:00+03:00")
+    slot.at = datetime.fromisoformat("2026-10-23T14:00:00+03:00")
     store.add_slot(slot)
     now = datetime.fromisoformat("2026-10-23T16:00:00+03:00")
     assert tick(store, tenant, clock=lambda: now, client=client).blocked == 1
@@ -192,7 +192,7 @@ def test_reconcile_never_turns_read_error_into_failed(respx_mock, store, tenant,
     store.checkpoint(delivery, Result(state=State.ACCEPTED, external_ids={"post_id": "p1"}))
     respx_mock.get("https://postiz.test/api/public/v1/posts").respond(401, json={})
     tick(store, tenant, clock=lambda: now, client=client)
-    assert store.deliveries(tenant.slug)[0].state == State.UNKNOWN
+    assert store.deliveries(tenant.slug)[0].state == State.ACCEPTED
 
 
 def test_missing_secret_preflight_no_fence(store, tenant, slot, now, client, monkeypatch):

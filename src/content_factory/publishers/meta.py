@@ -1,4 +1,5 @@
 from pathlib import Path
+from contextlib import ExitStack
 import json
 import re
 import time
@@ -8,7 +9,7 @@ import httpx
 
 from ..config import Channel
 from ..models import Asset, Delivery, Kind, Part, Result, Slot, State
-from .base import HttpPublisher, PublishRejected, UnknownResult, remote_url, validate_context
+from .base import HttpPublisher, PublishRejected, UnknownResult, media_file, remote_url, validate_context
 
 
 class MetaPublisher(HttpPublisher):
@@ -61,7 +62,8 @@ class MetaPublisher(HttpPublisher):
             uploaded = self.request("POST", upload_url, headers={**headers, "file_url": remote_url(asset)})
         else:
             path = Path(asset.source)
-            with path.open("rb") as file:
+            with ExitStack() as stack:
+                _, file, _ = media_file(stack, asset)
                 uploaded = self.request("POST", upload_url, headers={**headers, "offset": "0",
                                         "file_size": str(path.stat().st_size),
                                         "Content-Type": "application/octet-stream"}, content=file)
@@ -99,21 +101,21 @@ class MetaPublisher(HttpPublisher):
                     part = self.part(delivery, "story", post_id)
                     self.save(delivery, parts=[part], ids={"story_ids": delivery.external_ids.get("story_ids", []) + [post_id]})
                     parts.append(part)
-            return Result(state=State.ACCEPTED if delivery.external_ids.get("videos") else State.PUBLISHED,
-                          external_ids=delivery.external_ids, parts=parts)
+            return self.save(delivery, state=State.ACCEPTED if delivery.external_ids.get("videos") else State.PUBLISHED,
+                             ids={**delivery.external_ids, "sequence_complete": True}, parts=parts)
         if slot.kind == Kind.REEL:
             if len(media) != 1 or media[0].kind != "video":
                 raise PublishRejected("Facebook reel requires exactly one video")
             parts = self._upload_video(delivery, page, media[0], "video_reels", slot.caption)
-            return Result(state=State.ACCEPTED, external_ids=delivery.external_ids,
-                          parts=parts)
+            return self.save(delivery, state=State.ACCEPTED, ids={**delivery.external_ids, "sequence_complete": True}, parts=parts)
         if any(a.kind == "video" for a in media):
             if len(media) != 1:
                 raise PublishRejected("Facebook feed cannot mix photos and videos")
             data = self._call("POST", f"{page}/videos", data={"file_url": remote_url(media[0]), "description": slot.caption})
             video_id = self._id(data)
             part = self.part(delivery, "video", video_id)
-            return self.save(delivery, state=State.ACCEPTED, ids={"network": "facebook", "page_id": page, "videos": [video_id]}, parts=[part])
+            return self.save(delivery, state=State.ACCEPTED, ids={"network": "facebook", "page_id": page,
+                             "videos": [video_id], "sequence_complete": True}, parts=[part])
         payload = {"message": slot.caption}
         if media:
             payload["attached_media"] = json.dumps([{"media_fbid": self._photo(delivery, page, a)} for a in media])
@@ -209,7 +211,7 @@ class MetaPublisher(HttpPublisher):
                     return Result(state=State.ACCEPTED if delivery.state == State.ACCEPTED else State.UNKNOWN)
                 published.append(self.part(delivery, "video", video_id))
             # If a response was lost in a multi-story sequence, known videos do not prove the entire slot completed.
-            if delivery.state == State.UNKNOWN:
+            if not ids.get("sequence_complete"):
                 return Result(state=State.UNKNOWN, parts=published, error="partial sequence requires manual verification")
             return Result(state=State.PUBLISHED, parts=published)
         if ids.get("post_id"):
